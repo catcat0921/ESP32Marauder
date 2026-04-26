@@ -1862,7 +1862,7 @@ bool WiFiScan::joinWiFi(String ssid, String password, bool gui) {
   return true;
 }
 
-/*bool WiFiScan::startWiFi(String ssid, String password, bool gui) {
+bool WiFiScan::startWiFi(String ssid, String password, bool gui) {
   static const char * btns[] ={text16, ""};
   int count = 0;
   
@@ -1912,7 +1912,7 @@ bool WiFiScan::joinWiFi(String ssid, String password, bool gui) {
   #endif
 
   return true;
-}*/
+}
 
 // Apply WiFi settings
 void WiFiScan::initWiFi(uint8_t scan_mode) {
@@ -4591,7 +4591,7 @@ void WiFiScan::setBaseMacAddress(uint8_t macAddr[6]) {
   #endif
 }*/
 
-void WiFiScan::executeWarDrive() {
+/*void WiFiScan::executeWarDrive() {
   #ifdef HAS_GPS
     if (gps_obj.getGpsModuleStatus()) {
       bool do_save;
@@ -4678,6 +4678,151 @@ void WiFiScan::executeWarDrive() {
 
       if (!this->ble_scanning)
         WiFi.scanNetworks(true, true, false, 80);
+    }
+  #endif
+}*/
+
+void WiFiScan::executeWarDrive() {
+  #ifdef HAS_GPS
+    if (gps_obj.getGpsModuleStatus()) {
+      bool do_save;
+      String display_string;
+
+      // Weighted US-focused wardriving channel schedule.
+      // 2.4 GHz: 1, 6, 11 prioritized.
+      // 5 GHz: common non-DFS lower/upper UNII channels prioritized.
+      static const uint8_t wardrive_channels[] = {
+        1, 6, 11,
+        36, 40, 44, 48,
+        149, 153, 157, 161,
+        1, 6, 11,
+        36, 40, 44, 48,
+        149, 153, 157, 161,
+
+        // Full 2.4 GHz pass
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+
+        // Full 5 GHz pass
+        36, 40, 44, 48,
+        52, 56, 60, 64,
+        100, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+        149, 153, 157, 161, 165, 169, 173, 177
+      };
+
+      //static uint8_t wardrive_channel_index = 0;
+
+      const uint8_t wardrive_channel_count = sizeof(wardrive_channels) / sizeof(wardrive_channels[0]);
+
+      if (currentScanMode == WIFI_SCAN_WAR_DRIVE) {
+        #ifdef HAS_BT
+          if (pBLEScan->isScanning()) {
+            this->ble_scanning = true;
+            return;
+          }
+          else {
+            this->ble_scanning = false;
+          }
+        #endif
+      }
+
+      int scan_status = WiFi.scanComplete();
+
+      if (scan_status == WIFI_SCAN_RUNNING) {
+        delay(1);
+        return;
+      }
+      else if (scan_status == WIFI_SCAN_FAILED) {
+        this->wifi_initialized = true;
+        this->shutdownWiFi();
+        this->startWardriverWiFi();
+        this->wifi_initialized = true;
+        delay(100);
+      }
+
+      bool wifi_scan_done = (scan_status >= 0);
+
+      if (scan_status >= 0) {
+        for (int i = 0; i < scan_status; i++) {
+          do_save = gps_obj.getFixStatus();
+
+          uint8_t *this_bssid_raw = WiFi.BSSID(i);
+          char this_bssid[18] = {0};
+
+          sprintf(
+            this_bssid,
+            "%02X:%02X:%02X:%02X:%02X:%02X",
+            this_bssid_raw[0],
+            this_bssid_raw[1],
+            this_bssid_raw[2],
+            this_bssid_raw[3],
+            this_bssid_raw[4],
+            this_bssid_raw[5]
+          );
+
+          if (this->seen_mac(this_bssid_raw))
+            continue;
+
+          this->save_mac(this_bssid_raw);
+
+          String ssid = WiFi.SSID(i);
+          ssid.replace(",", "_");
+
+          String wardrive_line =
+            WiFi.BSSIDstr(i) + "," +
+            ssid + "," +
+            this->security_int_to_string(WiFi.encryptionType(i)) + "," +
+            gps_obj.getDatetime() + "," +
+            (String)WiFi.channel(i) + "," +
+            (String)WiFi.RSSI(i) + "," +
+            gps_obj.getLat() + "," +
+            gps_obj.getLon() + "," +
+            gps_obj.getAlt() + "," +
+            gps_obj.getAccuracy() + ",WIFI\n";
+
+          Serial.print((String)this->mac_history_cursor + " | " + wardrive_line);
+
+          if (do_save) {
+            buffer_obj.append(wardrive_line);
+          }
+
+          this->beacon_frames++;
+        }
+
+        WiFi.scanDelete();
+
+        // Only run BLE after the entire weighted WiFi channel list has completed.
+        if (currentScanMode == WIFI_SCAN_WAR_DRIVE && this->wardrive_channel_index >= wardrive_channel_count) {
+          #ifdef HAS_BT
+            this->bt_pending_clear = true;
+
+            while (bt_cb_busy)
+              delay(100);
+
+            pBLEScan->clearResults();
+
+            #ifdef HAS_NIMBLE_2
+              pBLEScan->start(500, false, false);
+            #else
+              pBLEScan->start(1, scanCompleteCB, false);
+            #endif
+
+            this->ble_scanning = true;
+            this->bt_pending_clear = false;
+          #endif
+        }
+      }
+
+      if (!this->ble_scanning) {
+        // BLE just finished, or WiFi channel cycle completed without BLE support.
+        // Start the next WiFi channel cycle.
+        if (this->wardrive_channel_index >= wardrive_channel_count)
+          this->wardrive_channel_index = 0;
+
+        uint8_t scan_channel = wardrive_channels[this->wardrive_channel_index];
+        this->wardrive_channel_index++;
+
+        WiFi.scanNetworks(true, true, false, 80, scan_channel);
+      }
     }
   #endif
 }
@@ -8778,8 +8923,13 @@ void WiFiScan::changeChannel(int chan) {
   esp_wifi_set_channel(this->set_channel, WIFI_SECOND_CHAN_NONE);
   delay(1);
   #ifdef HAS_SCREEN
-    if (this->currentScanMode == WIFI_SCAN_CHAN_ANALYZER)
-      this->addAnalyzerValue(this->set_channel * -1, -72, this->_analyzer_values, TFT_WIDTH);
+    if (this->currentScanMode == WIFI_SCAN_CHAN_ANALYZER) {
+      #if !defined(MARAUDER_CARDPUTER) && !defined(MARAUDER_CARDPUTER_ADV)
+        this->addAnalyzerValue(this->set_channel * -1, -72, this->_analyzer_values, TFT_WIDTH);
+      #else
+        this->addAnalyzerValue(this->set_channel * -1, -72, this->_analyzer_values, SCREEN_WIDTH);
+      #endif
+    }
   #endif
 }
 
@@ -8903,7 +9053,11 @@ void WiFiScan::signalAnalyzerLoop(uint32_t tick) {
         (this->currentScanMode == WIFI_SCAN_CHAN_ANALYZER)) {
       if (tick - this->initTime >= BANNER_TIME) {
         this->initTime = millis();
-        this->addAnalyzerValue(this->_analyzer_value * BASE_MULTIPLIER, -72, this->_analyzer_values, TFT_WIDTH);
+        #if !defined(MARAUDER_CARDPUTER) && !defined(MARAUDER_CARDPUTER_ADV)
+          this->addAnalyzerValue(this->_analyzer_value * BASE_MULTIPLIER, -72, this->_analyzer_values, TFT_WIDTH);
+        #else
+          this->addAnalyzerValue(this->_analyzer_value * BASE_MULTIPLIER, -72, this->_analyzer_values, SCREEN_WIDTH);
+        #endif
         this->_analyzer_value = 0;
         if (this->analyzer_name_update) {
           this->displayAnalyzerString(this->analyzer_name_string);
